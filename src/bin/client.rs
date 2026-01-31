@@ -1,11 +1,22 @@
 use std::{
-    io::{self, ErrorKind, prelude::*}, net::TcpStream, sync::mpsc::{self, Sender}, thread::{self, sleep}, time::Duration
+    io::{self, Result, Write}, net::TcpStream, sync::mpsc::{self, Sender}, thread::{self, sleep}, time::Duration
 };
+
+use mini_holdem::{cards::Card, events::{ClientBound, GameEvent, GamePlayerAction, ServerBound}, game::Pot, networking::client_network_loop, protocol::encode_server_bound};
 
 struct Player {
     username: String,
     money: u32,
     is_ready: bool,
+    is_folded: bool,
+}
+
+struct InGameInfo {
+    current_turn: u8,
+    current_bet: u32,
+    private_cards: [Card; 2],
+    public_cards: Vec<Card>,
+    pot_data: Vec<Pot>,
 }
 
 struct ClientData {
@@ -14,10 +25,10 @@ struct ClientData {
     player_id: Option<u8>,
     notifs: Vec<String>,
     conn: TcpStream,
-
+    in_game_info: Option<InGameInfo>,
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> Result<()> {
     let conn: TcpStream;
     loop {
         println!("Enter the server ip address.");
@@ -28,80 +39,59 @@ fn main() -> std::io::Result<()> {
             buf = "0.0.0.0".to_string();
         }
         buf.push_str(":9194");
-        match TcpStream::connect(buf) {
-            Ok(c) => {
-                c.set_nonblocking(true)?;
-                conn = c;
-                break;
-            },
-            Err(_) => println!("Failed to connect to this ip address.")
+        if let Ok(c) = TcpStream::connect(buf) {
+            conn = c;
+            break;
+        } else {
+            println!("Failed to connect to this address.")
         }
     }
 
-    sleep(Duration::from_secs(1));
-
-    // A♠ 7♦ K♣ J♥
-    // println!("\x1b[0mJ\x1b[31m♥ \x1b[0m7\x1b[31m♦");
-    // println!("\x1b[0mT\x1b[30m♣ \x1b[0mA\x1b[30m♠");
+    sleep(Duration::from_millis(100));
+    
     println!("\x1b[?1049h");
+    print!("\x1b[100A");
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || read_continuously(tx));
-
-    let mut client_data = ClientData { player_list: Vec::new(), last_player_list_size: 0, player_id: None, notifs: Vec::new(), conn };
-
-    send_packet(&mut client_data.conn, vec![0u8, 4u8])?;
-
+    
+    let mut client_data = ClientData { player_list: Vec::new(), last_player_list_size: 2, player_id: None, notifs: Vec::new(), conn, in_game_info: None };
+    
+    send_event(&mut client_data.conn, ServerBound::GetPlayerList)?;
+    
     let mut notif_cooldown = 0; // ms
+    
+    let (tx, received_events) = mpsc::channel();
+    let mut cloned = client_data.conn.try_clone().expect("Failed to clone stream.");
+    thread::spawn(move || client_network_loop(&mut cloned, tx));
+    
 
-    let mut remaining_packet_size = 0;
-    let mut received_packet_size = false;
-    let mut packet = Vec::<u8>::new();
+    let mut do_render = false;
     loop {
-        let mut buffer = [0u8; 1024];
-        let bytes_read = match client_data.conn.read(&mut buffer[..]) {
-            Err(e) if e.kind() == ErrorKind::WouldBlock => 0,
-            Err(_) => panic!("real error???"),
-            Ok(n) => n,
-        };
-        let mut update_player_list = false;
-        if bytes_read > 0 {
-            let bytes = &buffer[..bytes_read];
-            for byte in bytes {
-                if !received_packet_size {
-                    if *byte > 0 {
-                        remaining_packet_size = *byte;
-                        received_packet_size = true;
-                    }
-                } else {
-                    packet.push(*byte);
-                    remaining_packet_size -= 1;
-                    if remaining_packet_size == 0 {
-                        if handle_packet(&packet, &mut client_data) {
-                            update_player_list = true;
-                        }
-                        received_packet_size = false;
-                        packet.clear();
-                    }
-                }
-            }
+        while let Ok(event) = received_events.try_recv() {
+            handle_event(event, &mut client_data);
+            do_render = true;
         }
-        if update_player_list {
-            draw_player_list(&mut client_data);
+
+        if do_render {
+            render(&mut client_data);
         }
-            
+        do_render = false;
+
         if let Ok(str) = rx.try_recv() {
-            print!("\x1b[1A\x1b[2K\x1b[0G"); // clear what the user has entered
-            if str.eq("exit") {
-                break;
+            if str.eq("exit") { break }
+            let parts: Vec<String> = str.split(" ").map(|s| s.to_string()).collect();
+            if parts.len() >= 1 {
+                let cmd = &parts[0];
+                let args = &parts.get(1..).unwrap_or(&[]).to_vec();
+                handle_command(cmd.to_string(), args.to_vec(), &mut client_data)?;
             }
-            handle_command(str.split(" ").map(|s| s.to_string()).collect(), &mut client_data)?;
         }
 
         if notif_cooldown > 0 {
             notif_cooldown -= 1;
         }
         if notif_cooldown == 0 && !client_data.notifs.is_empty() {
-            print!("\x1b[1A\x1b[2K{}\x1b[1B\x1b[0G", client_data.notifs.pop().unwrap());
+            print!("\x1b[2A\x1b[2K{}\x1b[2B\x1b[0G", client_data.notifs.pop().unwrap());
             notif_cooldown = 2000;
         }
 
@@ -112,105 +102,134 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-fn handle_packet(packet: &Vec<u8>, client_data: &mut ClientData) -> bool {
-    if packet[0] == 0u8 {
-        match packet[1] {
-            0u8 => {
-                client_data.player_list.clear();
-                return true;
-            },
-            1u8 => {
-                let mut username = String::new();
-                for byte in &packet[7..] {
-                    username.push(*byte as char);
+fn handle_event(event: ClientBound, client_data: &mut ClientData) {
+    match event {
+        ClientBound::UpdatePlayerList(players) => {
+            client_data.player_list.clear();
+            for (is_ready, is_folded, money, username) in players {
+                client_data.player_list.push(Player { username, money, is_ready, is_folded });
+            }
+        },
+        ClientBound::YourId(id) => client_data.player_id = Some(id),
+        ClientBound::PlayerLeft(player) => client_data.notifs.push(player.to_owned()+&" left the game.".to_owned()),
+        ClientBound::PlayerJoined(player) => client_data.notifs.push(player.to_owned()+&" joined the game.".to_owned()),
+        ClientBound::GameStarted(cards) => {
+            for player in client_data.player_list.iter_mut() {
+                player.is_ready = false;
+            }
+            client_data.in_game_info = Some(InGameInfo { current_turn: 0, current_bet: 0, private_cards: cards, public_cards: Vec::new(), pot_data: Vec::new() });
+        },
+        ClientBound::GameEvent(game_event) => {
+            if let Some(game_info) = client_data.in_game_info.as_mut() {
+                match game_event {
+                    GameEvent::NextPlayer(player) => game_info.current_turn = player,
+                    GameEvent::OwnedMoneyChange(player, money) => client_data.player_list[player as usize].money = money,
+                    GameEvent::PlayerAction(player, action) => {
+                        let username = &client_data.player_list[player as usize].username;
+                        match action {
+                            GamePlayerAction::Check => client_data.notifs.push(username.to_owned()+" checked."),
+                            GamePlayerAction::AddMoney(money) => client_data.notifs.push(username.to_owned()+" added "+&money.to_string()),
+                            GamePlayerAction::Fold => {
+                                client_data.notifs.push(username.to_owned()+" folded.");
+                                client_data.player_list[player as usize].is_folded = true;
+                            }
+                        }
+                    },
+                    GameEvent::UpdateCurrentBet(money) => game_info.current_bet = money,
+                    GameEvent::UpdatePots(pots) => {
+                        game_info.pot_data.clear();
+                        for pot in pots {
+                            game_info.pot_data.push(pot);
+                        }
+                    },
+                    GameEvent::RevealFlop(cards) => game_info.public_cards.extend(cards),
+                    GameEvent::RevealTurn(card) | GameEvent::RevealRiver(card) => game_info.public_cards.push(card),
+                    GameEvent::Showdown(_map) => todo!(),
+                    GameEvent::ShowdownSteps(_steps) => todo!()
                 }
-                client_data.player_list.push(Player { username, money: get_money_from_bytes(&packet[3..7]), is_ready: packet[2] != 0u8 });
-                return true;
-            },
-            4u8 => {
-                client_data.player_id = Some(packet[2]);
-            },
-            3u8 => {
-                client_data.player_list[packet[2] as usize].is_ready = packet[3] == 1u8;
-                return true;
-            },
-            2u8 => {
-                client_data.player_list[packet[2] as usize].money = get_money_from_bytes(&packet[3..7]);
-            },
-            5u8 => {
-                client_data.notifs.push(client_data.player_list[packet[2] as usize].username.to_owned()+&" left the game.".to_owned());
-            },
-            _ => {}
+            }
         }
     }
-    return false;
 }
 
-fn handle_command(parts: Vec<String>, client_data: &mut ClientData) -> std::io::Result<()> {
-    if parts.is_empty() {
-        return Ok(());
-    }
-    if parts[0] == "join" {
-        if let Some(username) = parts.get(1) {
-            if !username.is_ascii() {
-                client_data.notifs.push("Usernames can only contain ASCII characters!".to_string());
-                return Ok(());
+fn handle_command(cmd: String, args: Vec<String>, client_data: &mut ClientData) -> Result<()> {
+    match cmd.as_str() {
+        "join" => {
+            if let Some(username) = args.get(0) {
+                if username == "" {
+                    return Ok(());
+                }
+                if !username.is_ascii() {
+                    client_data.notifs.push("Usernames can only contain ASCII characters!".to_string());
+                    return Ok(());
+                }
+                if username.len() < 3 {
+                    client_data.notifs.push("Usernames have to have at least 3 characters!".to_string());
+                    return Ok(());
+                }
+                if username.len() > 16 {
+                    client_data.notifs.push("Usernames can't have more than 16 characters!".to_string());
+                    return Ok(());
+                }
+                if client_data.player_list.iter().any(|p| p.username == *username) {
+                    client_data.notifs.push("This username is already taken!".to_string());
+                    return Ok(());
+                }
+                send_event(&mut client_data.conn, ServerBound::Login(username.to_string()))?;
+            } else {
+                client_data.notifs.push("Usage: join <username>".to_string());
             }
-            if username.contains(" ") {
-                client_data.notifs.push("Usernames can't contain spaces!".to_string());
-            }
-            if username.len() > 16 {
-                client_data.notifs.push("Usernames can't have more than 16 characters!".to_string());
-                return Ok(());
-            }
-            if client_data.player_list.iter().any(|p| p.username == *username) {
-                client_data.notifs.push("This username is already taken!".to_string());
-                return Ok(());
-            }
-            let mut msg = vec![0u8, 0u8];
-            msg.append(&mut username.as_bytes().to_vec());
-            send_packet(&mut client_data.conn, msg)?;
-        } else {
-            client_data.notifs.push("Usage: join <username>".to_string());
         }
-    } else if parts[0] == "ready" && !client_data.player_id.is_none() {
-        client_data.player_list[client_data.player_id.unwrap() as usize].is_ready = true;
-        send_packet(&mut client_data.conn, vec![0u8, 3u8, 1u8])?;
-    } else if parts[0] == "notready" && !client_data.player_id.is_none() {
-        client_data.player_list[client_data.player_id.unwrap() as usize].is_ready = false;
-        send_packet(&mut client_data.conn, vec![0u8, 3u8, 0u8])?;
-    } else if parts[0] == "leave" && !client_data.player_id.is_none() {
-        client_data.player_id = None;
-        send_packet(&mut client_data.conn, vec![0u8, 2u8])?;
-    }
+        "ready" => send_event(&mut client_data.conn, ServerBound::Ready(true))?,
+        "notready" => send_event(&mut client_data.conn, ServerBound::Ready(false))?,
+        "check" => send_event(&mut client_data.conn, ServerBound::GameAction(GamePlayerAction::Check))?,
+        "addmoney" => {
+            if args.len() == 1 && let Ok(money) = args[0].parse::<u32>() {
+                send_event(&mut client_data.conn, ServerBound::GameAction(GamePlayerAction::AddMoney(money)))?;
+            }
+        },
+        "fold" => send_event(&mut client_data.conn, ServerBound::GameAction(GamePlayerAction::Fold))?,
+        _ => {}
+    };
     Ok(())
 }
 
-fn send_packet(conn: &mut TcpStream, mut packet: Vec<u8>) -> std::io::Result<()> {
-    let mut msg = vec![packet.len() as u8];
-    msg.append(&mut packet);
-    conn.write_all(&msg)?;
-    Ok(())
-}
-
-fn get_money_from_bytes(bytes: &[u8]) -> u32 {
-    let mut money: u32 = 0;
-    for (i, &byte) in bytes.iter().enumerate() {
-        money |= (byte as u32) << (i * 8);
+fn render(client_data: &mut ClientData) {
+    for _ in 0..client_data.last_player_list_size {
+        print!("\x1b[1A\x1b[0G\x1b[2K");
     }
-    money
-}
 
-fn draw_player_list(client_data: &mut ClientData) {
-    print!("\x1b[{}A", client_data.last_player_list_size + 3);
-    for _ in 0..client_data.last_player_list_size+3 {
-        print!("\x1b[2K\x1b[1B\x1b[0G");
+    if let Some(game_info) = &client_data.in_game_info {
+        for (i, pot) in game_info.pot_data.iter().enumerate() {
+            print!("Pot {}: ${} ({})\x1b[1B\x1b[0G", i+1, pot.money, if pot.eligible_players.contains(&client_data.player_id.unwrap()) {
+                "eligible"
+            } else {
+                "not eligible"
+            });
+        }
+
+        print!("\x1b[1B\x1b[0G");
+        
+        let mut public_cards_display = String::new();
+        for card in &game_info.public_cards {
+            public_cards_display.push_str(&card.to_string());
+            public_cards_display.push(' ');
+        }
+        if game_info.public_cards.is_empty() {
+            public_cards_display = String::from("No cards yet");
+        }
+        print!("Public cards: {}\x1b[1B\x1b[0G", public_cards_display);
+        print!("Private cards: {} {}\x1b[1B\x1b[0G", game_info.private_cards[0], game_info.private_cards[1]);
+
+        print!("\x1b[1B\x1b[0G");
     }
+
     if client_data.player_list.is_empty() {
-        print!("\x1b[2AThe player list is empty!\x1b[2B\x1b[0G");
-        return;
+        print!("The player list is empty!\x1b[1B\x1b[0G");
+    } else {
+        print!("id |username        |money\x1b[1B\x1b[0G");
     }
-    print!("\x1b[{}Aid |username        |money\x1b[1B\x1b[0G", client_data.player_list.len()+2);
+    
     for (i, player) in client_data.player_list.iter().enumerate() {
         let username_padding = " ".repeat(16 - player.username.len());
         let money_padding = " ".repeat(11-player.money.to_string().len());
@@ -219,25 +238,40 @@ fn draw_player_list(client_data: &mut ClientData) {
         } else {
             &player.username
         };
-        let ready_display = if player.is_ready {
+        let extra = if player.is_ready {
             "ready!"
+        } else if player.is_folded {
+            "folded"
+        } else if let Some(game_info) = &client_data.in_game_info && game_info.current_turn == i as u8 {
+            "current turn"
         } else {
             ""
         };
-        print!("{}.  {}{} ${}{}{}\x1b[1B\x1b[0G", i+1, username_display, username_padding, player.money, money_padding, ready_display);
+        print!("{}.  {}{} ${}{}{}\x1b[1B\x1b[0G", i+1, username_display, username_padding, player.money, money_padding, extra);
     }
-    client_data.last_player_list_size = client_data.player_list.len();
-    print!("\x1b[1B\x1b[0G");
+    print!("\x1b[3B\x1b[0G");
+
+    client_data.last_player_list_size = 4;
+    client_data.last_player_list_size += client_data.player_list.len();
+    if let Some(game_info) = &client_data.in_game_info {
+        client_data.last_player_list_size += 4;
+        client_data.last_player_list_size += game_info.pot_data.len();
+    }
+}
+
+fn send_event(conn: &mut TcpStream, event: ServerBound) -> Result<()> {
+    let mut packet = encode_server_bound(event);
+    let mut msg = vec![packet.len() as u8];
+    msg.append(&mut packet);
+    conn.write_all(&msg)?;
+    Ok(())
 }
 
 fn read_continuously(tx: Sender<String>) {
     loop {
         let mut buf = String::new();
-        match io::stdin().read_line(&mut buf) {
-            Ok(_) => {},
-            Err(e) => panic!("{e}")
-        }
-        let to_send = buf.trim_end().to_string();
-        tx.send(to_send).unwrap();
+        io::stdin().read_line(&mut buf).expect("Failed to read input line.");
+        print!("\x1b[1A\x1b[2K\x1b[0G"); // clear what the user has entered
+        tx.send(buf.trim_end().to_string()).expect("Failed to send read input line to command parser.");
     }
 }

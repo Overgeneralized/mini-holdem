@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::HashMap};
+use std::{cmp::Ordering, fmt::{Display, Error}};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Card {
@@ -21,15 +21,45 @@ impl PartialEq for Card {
     }
 }
 impl Eq for Card {}
+impl Display for Card {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}\x1b[0m",
+            match self.rank {
+                0..9 => (self.rank+2).to_string(),
+                9 => String::from("J"),
+                10 => String::from("Q"),
+                11 => String::from("K"),
+                12 => String::from("A"),
+                _ => return Err(Error)
+            },
+            match self.suit {
+                0 => "\x1b[31m♥",
+                1 => "\x1b[31m♦",
+                2 => "\x1b[30m♠",
+                3 => "\x1b[30m♣",
+                _ => return Err(Error)
+            }
+        )
+    }
+}
 
 impl Card {
     pub fn to_byte(&self) -> u8 {
         // 00ssrrrr
         self.suit << 4 | self.rank
     }
+
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        let rank = byte & 0x0F;
+        if rank > 12 {
+            return None;
+        }
+        Some(Card { rank, suit: byte >> 4 })
+    }
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
+#[repr(u8)]
 pub enum HandCategory {
     HighCard,
     OnePair,
@@ -43,19 +73,20 @@ pub enum HandCategory {
     RoyalFlush,
 }
 impl HandCategory {
-    pub fn to_byte(&self) -> u8 {
-        match *self {
-            HandCategory::HighCard => 0u8,
-            HandCategory::OnePair => 1u8,
-            HandCategory::TwoPair => 2u8,
-            HandCategory::ThreeKind => 3u8,
-            HandCategory::Straight => 4u8,
-            HandCategory::Flush => 5u8,
-            HandCategory::FullHouse => 6u8,
-            HandCategory::FourKind => 7u8,
-            HandCategory::StraightFlush => 8u8,
-            HandCategory::RoyalFlush => 9u8,
-        }
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        Some(match byte {
+            0 => HandCategory::HighCard,
+            1 => HandCategory::OnePair,
+            2 => HandCategory::TwoPair,
+            3 => HandCategory::ThreeKind,
+            4 => HandCategory::Straight,
+            5 => HandCategory::Flush,
+            6 => HandCategory::FullHouse,
+            7 => HandCategory::FourKind,
+            8 => HandCategory::StraightFlush,
+            9 => HandCategory::RoyalFlush,
+            _ => return None,
+        })
     }
 }
 
@@ -86,6 +117,7 @@ impl PartialEq for HandRank {
 }
 impl Eq for HandRank {}
 
+#[derive(Debug, Clone)]
 pub enum ShowdownDecidingFactor {
     Category,
     Primary(Card, Card),
@@ -95,19 +127,29 @@ pub enum ShowdownDecidingFactor {
 }
 
 fn get_all_combinations(cards: &[Card; 7]) -> [[Card; 5]; 21] {
-    let mut returned = Vec::with_capacity(21);
-    for mask in 0u32..(1u32 << 7) {
-        if mask.count_ones() == 5 {
-            let mut combo = Vec::with_capacity(5);
-            for (i, card) in cards.iter().enumerate() {
-                if (mask >> i) & 1 == 1 {
-                    combo.push(*card);
+    let mut out = [[cards[0]; 5]; 21];
+    let mut n = 0;
+
+    for a in 0..3 {
+        for b in (a + 1)..4 {
+            for c in (b + 1)..5 {
+                for d in (c + 1)..6 {
+                    for e in (d + 1)..7 {
+                        out[n] = [
+                            cards[a],
+                            cards[b],
+                            cards[c],
+                            cards[d],
+                            cards[e],
+                        ];
+                        n += 1;
+                    }
                 }
             }
-            returned.push(combo.try_into().unwrap());
         }
     }
-    returned.try_into().unwrap()
+
+    out
 }
 
 fn rank_hand(cards: &[Card; 5]) -> HandRank {
@@ -119,41 +161,37 @@ fn rank_hand(cards: &[Card; 5]) -> HandRank {
     let is_low_ace = hand[0].rank == 0 && hand[1].rank == 1 && hand[2].rank == 2 && hand[3].rank == 3 && hand[4].rank == 12;
     let is_straight = is_low_ace || hand.windows(2).all(|w| w[0].rank + 1 == w[1].rank);
 
-    let mut rank_counts = HashMap::new();
+    let mut groups: [Vec<Card>; 13] = Default::default();
     for card in &hand {
-        *rank_counts.entry(card.rank).or_insert(0) += 1;
+        groups[card.rank as usize].push(*card);
     }
-    let mut counts: Vec<_> = rank_counts.values().cloned().collect();
-    counts.sort_unstable_by(|a, b| b.cmp(a));
 
-    let mut groups: Vec<(u8, usize, Vec<Card>)> = rank_counts
-        .iter()
-        .map(|(&rank, &count)| {
-            let cards = hand.iter().cloned().filter(|c| c.rank == rank).collect();
-            (rank, count, cards)
-        })
-        .collect();
-    
     groups.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then(b.0.cmp(&a.0))
+        b.len().cmp(&a.len())
     });
 
-    // primary and secondary are only filled if they are in a group larger than one card, the rest goes to kickers
     let mut primary = None;
     let mut secondary = None;
     let mut kickers = Vec::<Card>::new();
     for (i, group) in groups.iter().enumerate() {
-        if i == 0 && group.1 > 1 {
-            primary = group.2.first().copied();
-        } else if i == 1 && group.1 > 1 {
-            secondary = group.2.first().copied();
-        } else {
-            kickers.push(*group.2.first().unwrap());
+        if i == 0 && group.len() > 1 {
+            primary = group.first().copied();
+        } else if i == 1 && group.len() > 1 {
+            secondary = group.first().copied();
+        } else if !group.is_empty() {
+            kickers.push(*group.first().unwrap());
         }
     }
 
-    let category = match (&counts[..], is_straight, is_flush) {
+    kickers.sort_by(|a, b| b.cmp(a));
+
+    if let Some(p) = primary && let Some(s) = secondary && s.rank > p.rank {
+        primary = Some(s);
+        secondary = Some(p);
+    }
+
+    let counts = [groups[0].len(), groups[1].len(), groups[2].len(), groups[3].len(), groups[4].len()];
+    let category = match (counts, is_straight, is_flush) {
         ([1, 1, 1, 1, 1], true, true) => {
             if hand[0].rank == 8 {
                 HandCategory::RoyalFlush
@@ -161,11 +199,11 @@ fn rank_hand(cards: &[Card; 5]) -> HandRank {
                 HandCategory::StraightFlush
             }
         },
-        ([4, 1], _, _) => HandCategory::FourKind,
-        ([3, 2], _, _) => HandCategory::FullHouse,
-        ([3, 1, 1], _, _) => HandCategory::ThreeKind,
-        ([2, 2, 1], _, _) => HandCategory::TwoPair,
-        ([2, 1, 1, 1], _, _) => HandCategory::OnePair,
+        ([4, 1, 0, 0, 0], _, _) => HandCategory::FourKind,
+        ([3, 2, 0, 0, 0], _, _) => HandCategory::FullHouse,
+        ([3, 1, 1, 0, 0], _, _) => HandCategory::ThreeKind,
+        ([2, 2, 1, 0, 0], _, _) => HandCategory::TwoPair,
+        ([2, 1, 1, 1, 0], _, _) => HandCategory::OnePair,
         ([1, 1, 1, 1, 1], false, true) => HandCategory::Flush,
         ([1, 1, 1, 1, 1], true, false) => HandCategory::Straight,
         _ => HandCategory::HighCard
@@ -178,7 +216,7 @@ pub fn get_best_hand_rank(cards: &[Card; 7]) -> HandRank {
     get_all_combinations(cards).map(|c| rank_hand(&c)).iter().max().unwrap().clone()
 }
 
-pub fn compare_hand_ranks(hand1: &HandRank, hand2: &HandRank) -> (Ordering, ShowdownDecidingFactor) { // the two cards are the deciding factors in the comparison
+pub fn compare_hand_ranks(hand1: &HandRank, hand2: &HandRank) -> (Ordering, ShowdownDecidingFactor) {
     let category_comparison = hand1.category.cmp(&hand2.category);
     if category_comparison != Ordering::Equal {
         return (category_comparison, ShowdownDecidingFactor::Category);

@@ -1,19 +1,33 @@
-use std::{cmp::Ordering, collections::HashMap, time::{SystemTime, UNIX_EPOCH}};
-use crate::cards::{Card, HandRank, ShowdownDecidingFactor, compare_hand_ranks, get_best_hand_rank};
+use std::{cmp::{Ordering, max}, collections::HashMap};
+use rand::{seq::SliceRandom, thread_rng};
+
+use crate::{cards::{Card, HandRank, ShowdownDecidingFactor, compare_hand_ranks, get_best_hand_rank}, events::{GameEvent, GamePlayerAction}};
+
+#[derive(Debug, Clone)]
+pub struct Pot {
+    pub money: u32,
+    pub eligible_players: Vec<u8>,
+}
 
 #[derive(Clone, Copy)]
 pub struct Player {
+    pub id: u8,
     pub money: u32,
     total_contribution: u32,
     pub private_cards: [Card; 2],
     pub has_folded: bool,
 }
 
-pub struct Pot {
-    pub money: u32,
-    pub eligible_players: Vec<u8>,
+pub struct Game {
+    pub players: HashMap<u8, Player>,
+    pub current_bet: u32,
+    current_phase: u8, // 0 - 4, preflop, flop, turn, river, showdown
+    pub current_turn: u8,
+    last_bettor: u8,
+    public_cards: [Card; 5],
 }
 
+#[derive(Debug, Clone)]
 pub struct ShowdownStep {
     pub winners: Vec<u8>,
     pub winnings: u32,
@@ -23,83 +37,48 @@ pub struct ShowdownStep {
     pub win_reason: ShowdownDecidingFactor, // only used if it wasnt a tie
 }
 
-pub struct Game {
-    pub players: HashMap<u8, Player>,
-    current_bet: u32,
-    current_phase: u8, // 0 - 4, preflop, flop, turn, river, showdown
-    pub current_turn: u8,
-    last_bettor: u8,
-    public_cards: [Card; 5],
-}
-
-// the client is able to tell when something is a check, call, bet, raise or an all-in
-pub enum PlayerAction {
-    Fold,
-    Check,
-    AddMoney(u32), // can be anything: call, bet, raise, all-in
-}
-
-pub enum Event {
-    PlayerAction(u8, PlayerAction),
-    OwnedMoneyChange(u8, u32),
-    NextPlayer(u8),
-    UpdateCurrentBet(u32),
-    UpdatePots(Vec<Pot>),
-    RevealFlop([Card; 3]),
-    RevealTurn(Card),
-    RevealRiver(Card),
-    Showdown(HashMap<u8, ([Card; 2], HandRank)>),
-}
-
 impl Game {
-    pub fn advance_game(&mut self, action: PlayerAction) -> Vec<Event> {
+    pub fn advance_game(&mut self, action: GamePlayerAction) -> Option<Vec<GameEvent>> { // none means illegal action
+        if self.current_phase == 4 { return None }
         let player = self.players.get_mut(&self.current_turn).unwrap();
-        let mut events = Vec::<Event>::new();
+        let mut events = Vec::<GameEvent>::new();
         match action {
-            PlayerAction::AddMoney(money) => {
-                assert!(money > 0);
-                if player.total_contribution + money < self.current_bet {
-                    return events;
+            GamePlayerAction::AddMoney(money) => {
+                if player.total_contribution + money < self.current_bet && money != player.money { // all-ins are only recognized if the bet money is exactly equal to the player's money
+                    return None
                 }
-                if self.current_bet < money + player.total_contribution && money > player.money {
-                    return events;
+                if money > player.money {
+                    return None
                 }
-
-                let real_money = if money > player.money {
-                    player.money
-                } else {
-                    money
-                };
                 
-                if player.total_contribution + money > self.current_bet {
-                    self.current_bet = player.total_contribution + money;
-                    self.last_bettor = self.current_turn;
-                    events.push(Event::UpdateCurrentBet(self.current_bet));
-                }
+                self.current_bet = max(self.current_bet, player.total_contribution + money); // has to be done so that all-ins dont lower the bet
+                events.push(GameEvent::UpdateCurrentBet(self.current_bet));
 
-                player.money -= real_money;
-                player.total_contribution += real_money;
-                events.push(Event::OwnedMoneyChange(self.current_turn, player.money));
+                self.last_bettor = self.current_turn;
 
-                events.push(Event::PlayerAction(self.current_turn, PlayerAction::AddMoney(real_money)));
+                player.money -= money;
+                player.total_contribution += money;
+                events.push(GameEvent::OwnedMoneyChange(self.current_turn, player.money));
+
+                events.push(GameEvent::PlayerAction(self.current_turn, GamePlayerAction::AddMoney(money)));
+
+                events.push(GameEvent::UpdatePots(self.compute_pots()));
             },
-            PlayerAction::Fold => {
+            GamePlayerAction::Fold => {
                 player.has_folded = true;
-                events.push(Event::PlayerAction(self.current_turn, PlayerAction::Fold))
+                events.push(GameEvent::PlayerAction(self.current_turn, GamePlayerAction::Fold))
             },
-            PlayerAction::Check => {
-                if self.current_bet > player.total_contribution {
-                    return events;
+            GamePlayerAction::Check => {
+                if self.current_bet > player.total_contribution && player.money != 0 {
+                    return None;
                 }
-                events.push(Event::PlayerAction(self.current_turn, PlayerAction::Check))
+                events.push(GameEvent::PlayerAction(self.current_turn, GamePlayerAction::Check))
             }
         }
-
-        events.push(Event::UpdatePots(self.compute_pots()));
         
         if self.players.values().filter(|&&p| p.money > 0 && !p.has_folded).count() == 1 {
-            events.push(Event::Showdown(self.get_showdown_info()));
-            return events;
+            events.push(GameEvent::Showdown(self.get_showdown_info()));
+            return Some(events);
         }
         
         let player_count = self.players.len() as u8;
@@ -111,26 +90,25 @@ impl Game {
             next_turn = (next_turn + 1) % player_count;
         } 
 
-        if next_turn == self.last_bettor {
-            self.current_bet += 1;
+        if self.current_turn == self.last_bettor && matches!(action, GamePlayerAction::Check) {
             match self.current_phase {
-                1 => events.push(Event::RevealFlop(self.public_cards[0..3].try_into().unwrap())),
-                2 => events.push(Event::RevealTurn(self.public_cards[3])),
-                3 => events.push(Event::RevealRiver(self.public_cards[4])),
-                4 => events.push(Event::Showdown(self.get_showdown_info())),
+                0 => events.push(GameEvent::RevealFlop(self.public_cards[0..3].try_into().unwrap())),
+                1 => events.push(GameEvent::RevealTurn(self.public_cards[3])),
+                2 => events.push(GameEvent::RevealRiver(self.public_cards[4])),
+                3 => events.push(GameEvent::Showdown(self.get_showdown_info())),
                 _ => {} // should never happen
             }
-            self.last_bettor = next_turn;
             self.current_phase += 1;
         }
 
-        events.push(Event::NextPlayer(next_turn));
+        self.current_turn = next_turn;
 
-        events
+        events.push(GameEvent::NextPlayer(next_turn));
+
+        Some(events)
     }
 
     pub fn evaluate_showdown(&mut self) -> Vec<ShowdownStep> {
-        assert!(self.current_phase == 4);
         let mut steps = Vec::<ShowdownStep>::new();
         let info = self.get_showdown_info();
         let pots = self.compute_pots();
@@ -194,52 +172,64 @@ impl Game {
         steps
     }
 
-    fn compute_pots(&self) -> Vec<Pot> {
-        let mut contributions: Vec<(u8, Player)> = self.players.iter().filter(|p| p.1.total_contribution > 0).map(|p| (*p.0, *p.1)).collect();
-        contributions.sort_by_key(|p| p.1.total_contribution);
+    pub fn compute_pots(&self) -> Vec<Pot> {
+        let mut contributions: Vec<(u8, Player)> = self.players.iter().filter(|(_, p)| p.total_contribution > 0).map(|(id, p)| (*id, *p)).collect();
+        contributions.sort_by_key(|(_, p)| p.total_contribution);
 
         let mut pots = Vec::new();
-        let mut previous_level = 0;
 
         while !contributions.is_empty() {
             let level = contributions[0].1.total_contribution;
-            let portion = (level - previous_level) * contributions.len() as u32;
+            let portion = level * contributions.len() as u32;
 
-            pots.push(Pot { money: portion, eligible_players: contributions.iter().filter(|p| !p.1.has_folded).map(|p| p.0).collect() });
-
-            for contrib in contributions.iter_mut() {
-                contrib.1.total_contribution -= level;
+            if portion > 0 {
+                pots.push(Pot { money: portion, eligible_players: contributions.iter().filter(|(_, p)| !p.has_folded).map(|(id, _)| *id).collect() });
             }
-            contributions.retain(|p| p.1.total_contribution > 0);
 
-            previous_level = level;
+            for (_, player) in contributions.iter_mut() {
+                player.total_contribution -= level;
+            }
+            contributions.retain(|(_, p)| p.total_contribution > 0);
         }
         
         pots
     }
 
-    fn get_showdown_info(&self) -> HashMap<u8, ([Card; 2], HandRank)>{
+    fn get_showdown_info(&self) -> HashMap<u8, ([Card; 2], HandRank)> {
         let mut showdown_info = HashMap::new();
-        for p in self.players.clone() {
+        for p in self.players.iter() {
             let mut all_cards = Vec::with_capacity(7);
             all_cards.extend_from_slice(&p.1.private_cards);
             all_cards.extend_from_slice(&self.public_cards);
-            showdown_info.insert(p.0, (p.1.private_cards, get_best_hand_rank(all_cards.as_slice().try_into().unwrap())));
+            showdown_info.insert(*p.0, (p.1.private_cards, get_best_hand_rank(all_cards.as_slice().try_into().unwrap())));
         }
         showdown_info
     }
+
+    pub fn player(&self, id: u8) -> Player {
+        *self.players.get(&id).unwrap()
+    }
+
+    pub fn player_mut(&self, id: u8) -> &Player {
+        self.players.get(&id).unwrap()
+    }
 }
 
-pub fn make_game(lobby_players: Vec<(u8, u32)> /* player id (turn order at the table) and money */) -> Game {
-    assert!(lobby_players.len() >= 3);
-    assert!(lobby_players.iter().all(|p| p.1 > 10));
+pub fn make_game(lobby_players: Vec<(u8, u32)> /* player id (turn order at the table) and money */) -> Option<Game> { // none means cant create game
+    if lobby_players.len() < 3 {
+        return None
+    }
+    if !lobby_players.iter().all(|p| p.1 > 10) {
+        return None
+    }
 
     let mut deck = get_shuffled_deck();
 
     let mut players = HashMap::new();
-    for player in lobby_players {
-        players.insert(player.0, Player {
-            money: player.1,
+    for (id, money) in lobby_players {
+        players.insert(id, Player {
+            id,
+            money,
             total_contribution: 0,
             private_cards: [deck.pop().unwrap(), deck.pop().unwrap()],
             has_folded: false,
@@ -249,12 +239,14 @@ pub fn make_game(lobby_players: Vec<(u8, u32)> /* player id (turn order at the t
     let public_cards = [deck.pop().unwrap(), deck.pop().unwrap(), deck.pop().unwrap(), deck.pop().unwrap(), deck.pop().unwrap()];
 
     players.get_mut(&1).unwrap().money -= 5;
+    players.get_mut(&1).unwrap().total_contribution += 5;
     players.get_mut(&2).unwrap().money -= 10;
+    players.get_mut(&2).unwrap().total_contribution += 10;
     let current_turn = 3 % players.len() as u8;
-    Game { players, current_bet: 0, current_phase: 0, current_turn, last_bettor: 2, public_cards }
+    Some(Game { players, current_bet: 10, current_phase: 0, current_turn, last_bettor: 2, public_cards })
 }
 
-fn get_shuffled_deck() -> Vec<Card> {
+pub fn get_shuffled_deck() -> Vec<Card> {
     let mut deck = Vec::<Card>::new();
     for suit in 0..4 {
         for rank in 0..13 {
@@ -262,12 +254,7 @@ fn get_shuffled_deck() -> Vec<Card> {
         }
     }
 
-    let mut rng = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() ^ std::process::id() as u128;
-    for i in (1..deck.len()).rev() {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-        let j = rng as usize % (i + 1);
-        deck.swap(i, j);
-    }
+    deck.shuffle(&mut thread_rng());
 
     deck
 }
