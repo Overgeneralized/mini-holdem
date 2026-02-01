@@ -82,9 +82,9 @@ fn handle_event(event: ServerBound, client: u64, lobby: &mut Lobby, client_chann
                     game.player(id).has_folded = true;
                 }
             } else {
+                lobby.players.remove(&client);
                 send_player_list_update(lobby, client_channels, None);
                 check_for_game_start(client_channels, lobby);
-                lobby.players.remove(&client);
             }
 
             lobby.network_to_game.remove(&client);
@@ -151,6 +151,9 @@ fn advance_game(player_action: GamePlayerAction, lobby: &mut Lobby, client_chann
             for &id in &lobby.queued_for_removal {
                 let username = lobby.players.remove(&lobby.game_to_network[id as usize]).unwrap().username;
                 broadcast_event(client_channels, ClientBound::PlayerLeft(username));
+            }
+            for (_, user) in &mut lobby.players {
+                user.ready = false;
             }
             lobby.game = None;
             lobby.queued_for_removal.clear();
