@@ -1,6 +1,6 @@
-use std::{collections::{HashMap, HashSet}, net::TcpListener, sync::mpsc::{self, Sender}, thread};
+use std::{collections::{HashMap, HashSet}, net::{SocketAddr, TcpListener}, sync::mpsc::{self, Sender}, thread};
 
-use mini_holdem::{events::{ClientBound, GameEvent, GamePlayerAction, ServerBound}, game::{Game, make_game}, networking::handle_client};
+use mini_holdem::{events::{ClientBound, GameEvent, GamePlayerAction, PlayerState, ServerBound}, game::{Game, make_game}, networking::handle_client};
 
 type ClientChannels = HashMap<u64, Sender<ClientBound>>;
 
@@ -12,23 +12,23 @@ struct User {
 
 struct Lobby {
     players: HashMap<u64, User>,
+    player_order: Vec<u64>,
     network_to_game: HashMap<u64, u8>,
-    game_to_network: Vec<u64>,
     default_money: u32,
     game: Option<Game>,
     queued_for_removal: HashSet<u8>,
 }
 
 fn main() -> std::io::Result<()> {
-    let listener = TcpListener::bind("0.0.0.0:9194").expect("Couldn't bind to 0.0.0.0:9194.");
+    let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 9194))).expect("Couldn't bind to 0.0.0.0:9194.");
     listener.set_nonblocking(true)?;
-    println!("Listening on 0.0.0.0 to port 9194.");
+    println!("Bound to 0.0.0.0 with port 9194.");
 
     let mut client_channels: HashMap<u64, Sender<ClientBound>> = HashMap::new();
 
     let (server_bound_sender, server_bound_receiver) = mpsc::channel();
 
-    let mut lobby = Lobby { players: HashMap::new(), network_to_game: HashMap::new(), game_to_network: Vec::new(), default_money: 1000, game: None, queued_for_removal: HashSet::new() };
+    let mut lobby = Lobby { players: HashMap::new(), player_order: Vec::new(), network_to_game: HashMap::new(), default_money: 1000, game: None, queued_for_removal: HashSet::new() };
     let mut next_id: u64 = 0;
 
     loop {
@@ -64,10 +64,11 @@ fn handle_event(event: ServerBound, client: u64, lobby: &mut Lobby, client_chann
                 return;
             }
             lobby.players.insert(client, User { money: lobby.default_money, username: name.clone(), ready: false });
+            lobby.player_order.push(client);
             send_player_list_update(lobby, client_channels, None);
             broadcast_event(client_channels, ClientBound::PlayerJoined(name));
         },
-        ServerBound::Leave => {
+        ServerBound::Disconnect => {
             client_channels.remove(&client);
 
             if let Some(player) = lobby.players.get(&client) {
@@ -76,13 +77,15 @@ fn handle_event(event: ServerBound, client: u64, lobby: &mut Lobby, client_chann
 
             if let Some(&id) = lobby.network_to_game.get(&client) && let Some(game) = &mut lobby.game {
                 lobby.queued_for_removal.insert(id);
+                broadcast_event(client_channels, ClientBound::GameEvent(GameEvent::InGamePlayerLeave(id)));
                 if id == game.current_turn {
                     advance_game(GamePlayerAction::Fold, lobby, client_channels);
                 } else {
-                    game.player(id).has_folded = true;
+                    (*game.player_mut(id)).has_folded = true;
                 }
             } else {
                 lobby.players.remove(&client);
+                lobby.player_order.retain(|&p| p != client);
                 send_player_list_update(lobby, client_channels, None);
                 check_for_game_start(client_channels, lobby);
             }
@@ -90,10 +93,12 @@ fn handle_event(event: ServerBound, client: u64, lobby: &mut Lobby, client_chann
             lobby.network_to_game.remove(&client);
         },
         ServerBound::Ready(ready) => {
-            lobby.players.get_mut(&client).unwrap().ready = ready;
-            send_player_list_update(lobby, client_channels, None);
+            if let Some(user) = lobby.players.get_mut(&client) {
+                user.ready = ready;
+                send_player_list_update(lobby, client_channels, None);
+                check_for_game_start(client_channels, lobby);
+            }
 
-            check_for_game_start(client_channels, lobby);
         },
         ServerBound::GameAction(action) => {
             if let Some(game) = lobby.game.as_ref() && let Some(&id) = lobby.network_to_game.get(&client) && game.current_turn == id {
@@ -109,28 +114,22 @@ fn handle_event(event: ServerBound, client: u64, lobby: &mut Lobby, client_chann
 fn check_for_game_start(client_channels: &ClientChannels, lobby: &mut Lobby) {
     if lobby.players.iter().all(|(_, user)| user.ready) && lobby.players.len() >= 3 {
         let mut list = Vec::new();
-        lobby.game_to_network = vec![0; lobby.players.len()];
-        for (game_id, (&network_id, user)) in lobby.players.iter().enumerate() {
-            list.push((game_id as u8, user.money));
+        for (game_id, &network_id) in lobby.player_order.iter().enumerate() {
+            let player = lobby.players.get(&network_id).unwrap();
+            list.push(player.money);
             lobby.network_to_game.insert(network_id, game_id as u8);
-            lobby.game_to_network[game_id] = network_id;
         }
 
         if let Some(game) = make_game(list) {
-            for (id, player) in &game.players {
-                let channel = client_channels.get(&lobby.game_to_network[*id as usize]).unwrap();
-                let _ = channel.send(ClientBound::GameStarted(player.private_cards));
-                let _ = channel.send(ClientBound::YourId(*id));
+            for (id, player) in game.players.iter().enumerate() {
+                let _ = client_channels.get(&lobby.player_order[id]).unwrap().send(ClientBound::GameStarted(player.private_cards));
             }
-
-            broadcast_event(client_channels, ClientBound::GameEvent(GameEvent::OwnedMoneyChange(1, game.player(1).money)));
-            broadcast_event(client_channels, ClientBound::GameEvent(GameEvent::OwnedMoneyChange(2, game.player(2).money)));
-
-            broadcast_event(client_channels, ClientBound::GameEvent(GameEvent::UpdateCurrentBet(game.current_bet)));
-            broadcast_event(client_channels, ClientBound::GameEvent(GameEvent::UpdatePots(game.compute_pots())));
-            broadcast_event(client_channels, ClientBound::GameEvent(GameEvent::NextPlayer(game.current_turn)));
             
             lobby.game = Some(game);
+
+            // big blind and small blind forced
+            advance_game(GamePlayerAction::AddMoney(5), lobby, client_channels);
+            advance_game(GamePlayerAction::AddMoney(10), lobby, client_channels);
         }
     }
 }
@@ -143,21 +142,22 @@ fn advance_game(player_action: GamePlayerAction, lobby: &mut Lobby, client_chann
 
         if events.iter().any(|e| matches!(e, GameEvent::Showdown(_))) {
             // cleanup
-            for (&id, &player) in &game.players {
-                if let Some(user) = lobby.players.get_mut(&lobby.game_to_network[id as usize]) {
+            for &id in &lobby.queued_for_removal {
+                let newtork_id = lobby.player_order[id as usize];
+                let username = lobby.players.remove(&newtork_id).unwrap().username;
+                broadcast_event(client_channels, ClientBound::PlayerLeft(username));
+                lobby.player_order.retain(|c| *c != newtork_id);
+            }
+            for (id, &player) in game.players.iter().enumerate() {
+                if let Some(network_id) = lobby.player_order.get(id) && let Some(user) = lobby.players.get_mut(&*network_id) {
                     user.money = player.money;
                 }
-            }
-            for &id in &lobby.queued_for_removal {
-                let username = lobby.players.remove(&lobby.game_to_network[id as usize]).unwrap().username;
-                broadcast_event(client_channels, ClientBound::PlayerLeft(username));
             }
             for (_, user) in &mut lobby.players {
                 user.ready = false;
             }
             lobby.game = None;
             lobby.queued_for_removal.clear();
-            lobby.game_to_network.clear();
             lobby.network_to_game.clear();
             send_player_list_update(lobby, client_channels, None);
         }
@@ -166,12 +166,13 @@ fn advance_game(player_action: GamePlayerAction, lobby: &mut Lobby, client_chann
 
 fn send_player_list_update(lobby: &Lobby, client_channels: &ClientChannels, private_id: Option<u64>) {
     let mut list = Vec::new();
-    for (id, user) in &lobby.players {
+    for network_id in &lobby.player_order {
+        let user = lobby.players.get(network_id).unwrap();
         if let Some(game) = &lobby.game {
-            let player = game.player(*lobby.network_to_game.get(&id).unwrap());
-            list.push((false, player.has_folded, player.money, user.username.clone()));
+            let player = game.player(*lobby.network_to_game.get(network_id).unwrap());
+            list.push((if lobby.queued_for_removal.contains(&player.id) { PlayerState::Left } else if player.has_folded { PlayerState::Folded } else { PlayerState::InGame }, player.money, user.username.clone()));
         } else {
-            list.push((user.ready, false, user.money, user.username.clone()));
+            list.push((if user.ready { PlayerState::Ready } else { PlayerState::NotReady }, user.money, user.username.clone()));
         }
     }
 
@@ -179,6 +180,11 @@ fn send_player_list_update(lobby: &Lobby, client_channels: &ClientChannels, priv
         let _ = client_channels.get(&id).unwrap().send(ClientBound::UpdatePlayerList(list));
     } else {
         broadcast_event(client_channels, ClientBound::UpdatePlayerList(list));
+        for (index, network_id) in lobby.player_order.iter().enumerate() {
+            if let Some(channel) = client_channels.get(network_id) {
+                let _ = channel.send(ClientBound::YourIndex(index as u8));
+            }
+        }
     }
 }
 

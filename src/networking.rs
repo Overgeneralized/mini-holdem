@@ -1,6 +1,6 @@
-use std::{io::{Read, Write}, net::TcpStream, sync::mpsc::{Receiver, Sender}, thread};
+use std::{io::{Read, Write, Result}, net::TcpStream, sync::mpsc::{Receiver, Sender}, thread};
 
-use crate::{events::{ClientBound, ServerBound}, protocol::{decode_client_bound, decode_server_bound, encode_client_bound}};
+use crate::{events::{ClientBound, ServerBound}, protocol::{decode_client_bound, decode_server_bound, encode_client_bound, encode_server_bound}};
 
 pub fn client_network_loop(stream: &mut TcpStream, tx: Sender<ClientBound>) {
     let mut remaining_packet_size = 0;
@@ -44,7 +44,7 @@ pub fn client_network_loop(stream: &mut TcpStream, tx: Sender<ClientBound>) {
     }
 }
 
-pub fn handle_client(id: u64, mut stream: TcpStream, client_bound_receiver: Receiver<ClientBound>, server_bound_sender: Sender<(u64, ServerBound)>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn handle_client(id: u64, mut stream: TcpStream, client_bound_receiver: Receiver<ClientBound>, server_bound_sender: Sender<(u64, ServerBound)>) -> core::result::Result<(), Box<dyn std::error::Error>> {
     stream.set_nonblocking(true)?;
 
     let mut buf = [0u8; 1024];
@@ -57,7 +57,7 @@ pub fn handle_client(id: u64, mut stream: TcpStream, client_bound_receiver: Rece
         let received_size = match stream.read(&mut buf) {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {0},
             Ok(0) | Err(_) => {
-                server_bound_sender.send((id, ServerBound::Leave))?;
+                server_bound_sender.send((id, ServerBound::Disconnect))?;
                 return Ok(());
             },
             Ok(n) => n,
@@ -77,7 +77,7 @@ pub fn handle_client(id: u64, mut stream: TcpStream, client_bound_receiver: Rece
                     if remaining_packet_size == 0 {
                         if let Some(event) = decode_server_bound(&packet) {
                             server_bound_sender.send((id, event.clone()))?;
-                            if matches!(event, ServerBound::Leave) {
+                            if matches!(event, ServerBound::Disconnect) {
                                 return Ok(())
                             }
                         }
@@ -93,11 +93,19 @@ pub fn handle_client(id: u64, mut stream: TcpStream, client_bound_receiver: Rece
             let mut msg = vec![packet.len() as u8];
             msg.append(&mut packet);
             if let Err(_) = stream.write_all(&msg) {
-                server_bound_sender.send((id, ServerBound::Leave))?;
+                server_bound_sender.send((id, ServerBound::Disconnect))?;
                 return Ok(());
             }
         }
 
         thread::sleep(std::time::Duration::from_millis(1));
     }
+}
+
+pub fn send_event(conn: &mut TcpStream, event: ServerBound) -> Result<()> {
+    let mut packet = encode_server_bound(event);
+    let mut msg = vec![packet.len() as u8];
+    msg.append(&mut packet);
+    conn.write_all(&msg)?;
+    Ok(())
 }

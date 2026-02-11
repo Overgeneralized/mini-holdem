@@ -58,6 +58,10 @@ impl Card {
     }
 }
 
+pub fn format_cards(cards: &[Card]) -> String {
+    cards.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" ")
+}
+
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
 #[repr(u8)]
 pub enum HandCategory {
@@ -93,8 +97,8 @@ impl HandCategory {
 #[derive(Debug, Clone)]
 pub struct HandRank {
     pub category: HandCategory,
-    pub primary: Option<Card>,
-    pub secondary: Option<Card>,
+    pub primary: Vec<Card>,
+    pub secondary: Vec<Card>,
     pub kickers: Vec<Card>,
 }
 impl Ord for HandRank {
@@ -116,14 +120,30 @@ impl PartialEq for HandRank {
     }
 }
 impl Eq for HandRank {}
+impl Display for HandRank {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.category {
+            HandCategory::HighCard => write!(f, "High card with kickers {}", format_cards(&self.kickers)),
+            HandCategory::OnePair => write!(f, "Pair with cards {} and kickers {}", format_cards(&self.primary), format_cards(&self.kickers)),
+            HandCategory::TwoPair => write!(f, "Two pairs {} and {} with kicker {}", format_cards(&self.primary), format_cards(&self.secondary), self.kickers[0]),
+            HandCategory::ThreeKind => write!(f, "Three of a kind with cards {} with kickers {}", format_cards(&self.primary), format_cards(&self.kickers)),
+            HandCategory::Straight => write!(f, "Straight with cards {}", format_cards(&self.kickers)),
+            HandCategory::Flush => write!(f, "Flush with cards {}", format_cards(&self.kickers)),
+            HandCategory::FullHouse => write!(f, "Full house with card triple {} and pair {}", format_cards(&self.primary), format_cards(&self.secondary)),
+            HandCategory::FourKind => write!(f, "Four of a kind with cards {} and kicker {}", format_cards(&self.primary), self.kickers[0]),
+            HandCategory::StraightFlush => write!(f, "Straight flush with cards {}", format_cards(&self.kickers)),
+            HandCategory::RoyalFlush => write!(f, "Royal flush with cards {}", format_cards(&self.kickers))
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ShowdownDecidingFactor {
     Category,
-    Primary(Card, Card),
-    Secondary(Card, Card),
-    Kicker(Card, Card),
-    None,
+    Primary(Vec<Card>, Vec<Card>),
+    Secondary(Vec<Card>, Vec<Card>),
+    Kicker(Vec<Card>, Vec<Card>),
+    Tie,
 }
 
 fn get_all_combinations(cards: &[Card; 7]) -> [[Card; 5]; 21] {
@@ -170,14 +190,14 @@ fn rank_hand(cards: &[Card; 5]) -> HandRank {
         b.len().cmp(&a.len())
     });
 
-    let mut primary = None;
-    let mut secondary = None;
+    let mut primary = Vec::new();
+    let mut secondary = Vec::new();
     let mut kickers = Vec::<Card>::new();
     for (i, group) in groups.iter().enumerate() {
         if i == 0 && group.len() > 1 {
-            primary = group.first().copied();
+            primary = group.clone();
         } else if i == 1 && group.len() > 1 {
-            secondary = group.first().copied();
+            secondary = group.clone();
         } else if !group.is_empty() {
             kickers.push(*group.first().unwrap());
         }
@@ -185,9 +205,10 @@ fn rank_hand(cards: &[Card; 5]) -> HandRank {
 
     kickers.sort_by(|a, b| b.cmp(a));
 
-    if let Some(p) = primary && let Some(s) = secondary && s.rank > p.rank {
-        primary = Some(s);
-        secondary = Some(p);
+    if primary.len() == secondary.len() && let Some(primary_card) = primary.first() && let Some(secondary_card) = secondary.first() && secondary_card.rank > primary_card.rank {
+        let temp = primary;
+        primary = secondary;
+        secondary = temp;
     }
 
     let counts = [groups[0].len(), groups[1].len(), groups[2].len(), groups[3].len(), groups[4].len()];
@@ -212,8 +233,10 @@ fn rank_hand(cards: &[Card; 5]) -> HandRank {
     HandRank { category, primary, secondary, kickers }
 }
 
-pub fn get_best_hand_rank(cards: &[Card; 7]) -> HandRank {
-    get_all_combinations(cards).map(|c| rank_hand(&c)).iter().max().unwrap().clone()
+pub fn get_best_hand_rank(cards: &[Card; 7]) -> ([Card; 5], HandRank) {
+    let mut hand_ranks = get_all_combinations(cards).map(|c| (c, rank_hand(&c)));
+    hand_ranks.sort_by(|a, b| b.1.cmp(&a.1));
+    hand_ranks[0].clone()
 }
 
 pub fn compare_hand_ranks(hand1: &HandRank, hand2: &HandRank) -> (Ordering, ShowdownDecidingFactor) {
@@ -222,17 +245,17 @@ pub fn compare_hand_ranks(hand1: &HandRank, hand2: &HandRank) -> (Ordering, Show
         return (category_comparison, ShowdownDecidingFactor::Category);
     }
 
-    if let Some(a) = hand1.primary && let Some(b) = hand2.primary {
+    if let Some(a) = hand1.primary.first() && let Some(b) = hand2.primary.first() {
         let comparison = a.cmp(&b);
         if comparison != Ordering::Equal {
-            return (comparison, ShowdownDecidingFactor::Primary(a, b));
+            return (comparison, ShowdownDecidingFactor::Primary(hand1.primary.clone(), hand2.primary.clone()));
         }
     }
 
-    if let Some(a) = hand1.secondary && let Some(b) = hand2.secondary {
+    if let Some(a) = hand1.secondary.first() && let Some(b) = hand2.secondary.first() {
         let comparison = a.cmp(&b);
         if comparison != Ordering::Equal {
-            return (comparison, ShowdownDecidingFactor::Secondary(a, b));
+            return (comparison, ShowdownDecidingFactor::Secondary(hand1.secondary.clone(), hand2.secondary.clone()));
         }
     }
 
@@ -240,9 +263,9 @@ pub fn compare_hand_ranks(hand1: &HandRank, hand2: &HandRank) -> (Ordering, Show
     for (&a, &b) in hand1.kickers.iter().zip(hand2.kickers.iter()) {
         let comparison = a.cmp(&b);
         if comparison != Ordering::Equal {
-            return (comparison, ShowdownDecidingFactor::Kicker(a, b));
+            return (comparison, ShowdownDecidingFactor::Kicker(hand1.kickers.clone(), hand2.kickers.clone()));
         }
     }
 
-    (Ordering::Equal, ShowdownDecidingFactor::None)
+    (Ordering::Equal, ShowdownDecidingFactor::Tie)
 }

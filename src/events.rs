@@ -1,11 +1,11 @@
-use std::collections::HashMap;
-
 use crate::{cards::{Card, HandRank}, game::{Pot, ShowdownStep}};
+
+pub type ShowdownInfo = (Vec<([Card; 2], [Card; 5], HandRank)>, Vec<ShowdownStep>);
 
 #[derive(Debug, Clone)]
 pub enum ServerBound {
     Login(String),
-    Leave,
+    Disconnect,
     Ready(bool),
     GetPlayerList,
     GameAction(GamePlayerAction)
@@ -13,11 +13,11 @@ pub enum ServerBound {
 
 #[derive(Debug, Clone)]
 pub enum ClientBound {
-    UpdatePlayerList(Vec<(bool, bool, u32, String)>), // is ready, is folded, money, username
-    YourId(u8),
+    UpdatePlayerList(Vec<(PlayerState, u32, String)>), // state, money, username
+    YourIndex(u8),
     PlayerLeft(String),
     PlayerJoined(String),
-    GameStarted([Card; 2]), // private cards
+    GameStarted([Card; 2]), // player id and private cards
     GameEvent(GameEvent)
 }
 
@@ -39,6 +39,27 @@ pub enum GameEvent {
     RevealFlop([Card; 3]),
     RevealTurn(Card),
     RevealRiver(Card),
-    Showdown(HashMap<u8, ([Card; 2], HandRank)>),
-    ShowdownSteps(Vec<ShowdownStep>)
+    Showdown(ShowdownInfo),
+    InGamePlayerLeave(u8)
+}
+
+#[derive(Debug, Clone)]
+pub enum PlayerState {
+    NotReady,
+    Ready,
+    InGame,
+    Folded,
+    Left
+}
+impl PlayerState {
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        Some(match byte {
+            0 => Self::NotReady,
+            1 => Self::Ready,
+            2 => Self::InGame,
+            3 => Self::Folded,
+            4 => Self::Left,
+            _ => return None
+        })
+    }
 }

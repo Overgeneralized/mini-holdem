@@ -1,0 +1,281 @@
+use std::{cmp::Ordering, fmt::{Display, Error}};
+
+#[derive(Debug, Clone, Copy)]
+pub struct Card {
+    pub rank: u8, // 0 to 8 is 2 to 10, then 9 - J, 10 - Q, 11 - K, 12 - A
+    pub suit: u8, // who cares which is which until we make them display
+}
+impl Ord for Card {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.rank.cmp(&other.rank)
+    }
+}
+impl PartialOrd for Card {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for Card {
+    fn eq(&self, other: &Self) -> bool {
+        self.rank == other.rank
+    }
+}
+impl Eq for Card {}
+impl Display for Card {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}\x1b[0m",
+            match self.rank {
+                0..9 => (self.rank+2).to_string(),
+                9 => String::from("J"),
+                10 => String::from("Q"),
+                11 => String::from("K"),
+                12 => String::from("A"),
+                _ => return Err(Error)
+            },
+            match self.suit {
+                0 => "\x1b[31m♥",
+                1 => "\x1b[31m♦",
+                2 => "\x1b[30m♠",
+                3 => "\x1b[30m♣",
+                _ => return Err(Error)
+            }
+        )
+    }
+}
+
+impl Card {
+    pub fn to_byte(&self) -> u8 {
+        // 00ssrrrr
+        self.suit << 4 | self.rank
+    }
+
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        let rank = byte & 0x0F;
+        if rank > 12 {
+            return None;
+        }
+        Some(Card { rank, suit: byte >> 4 })
+    }
+}
+
+// kickers (or just cards) are sorted from highest to lowest
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+pub enum HandRank {
+    HighCard {
+        kickers: [Card; 5]
+    },
+    OnePair {
+        pair_cards: [Card; 2],
+        kickers: [Card; 3]
+    },
+    TwoPair {
+        higher_pair_cards: [Card; 2],
+        lower_pair_cards: [Card; 3],
+        kicker: Card
+    },
+    ThreeKind {
+        three_cards: [Card; 3],
+        kickers: [Card; 2]
+    },
+    Straight {
+        cards: [Card; 5]
+    },
+    Flush {
+        cards: [Card; 5]
+    },
+    FullHouse {
+        three_cards: [Card; 3],
+        pair_cards: [Card; 2]
+    },
+    FourKind {
+        four_cards: [Card; 4],
+        kicker: Card
+    },
+    StraightFlush {
+        cards: [Card; 5]
+    },
+    RoyalFlush {
+        cards: [Card; 5]
+    },
+}
+impl HandRank {
+    pub fn category_byte(&self) -> u8 {
+        match self {
+            HandRank::HighCard { .. } => 0,
+            HandRank::OnePair { .. } => 1,
+            HandRank::TwoPair { .. } => 2,
+            HandRank::ThreeKind { .. } => 3,
+            HandRank::Straight { .. } => 4,
+            HandRank::Flush { .. } => 5,
+            HandRank::FullHouse { .. } => 6,
+            HandRank::FourKind { .. } => 7,
+            HandRank::StraightFlush { .. } => 8,
+            HandRank::RoyalFlush { .. } => 9,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ShowdownDecidingFactor {
+    Category,
+    Primary(Card, Card),
+    Secondary(Card, Card),
+    Kicker(Card, Card),
+    None,
+}
+
+fn get_all_combinations(cards: &[Card; 7]) -> [[Card; 5]; 21] {
+    let mut out = [[cards[0]; 5]; 21];
+    let mut n = 0;
+
+    for a in 0..3 {
+        for b in (a + 1)..4 {
+            for c in (b + 1)..5 {
+                for d in (c + 1)..6 {
+                    for e in (d + 1)..7 {
+                        out[n] = [
+                            cards[a],
+                            cards[b],
+                            cards[c],
+                            cards[d],
+                            cards[e],
+                        ];
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn rank_hand(cards: &[Card; 5]) -> HandRank {
+    let mut hand = *cards;
+    hand.sort_by(|a, b| a.rank.cmp(&b.rank));
+
+    let is_flush = hand.into_iter().map(|c| c.suit).all(|c| c == hand[0].suit);
+
+    let is_low_ace = hand[0].rank == 0 && hand[1].rank == 1 && hand[2].rank == 2 && hand[3].rank == 3 && hand[4].rank == 12;
+    let is_straight = is_low_ace || hand.windows(2).all(|w| w[0].rank + 1 == w[1].rank);
+
+    let mut groups: [Vec<Card>; 13] = Default::default();
+    for card in &hand {
+        groups[card.rank as usize].push(*card);
+    }
+
+    groups.sort_by(|a, b| {
+        b.len().cmp(&a.len())
+    });
+
+    let counts = [groups[0].len(), groups[1].len(), groups[2].len(), groups[3].len(), groups[4].len()];
+    match (counts, is_straight, is_flush) {
+        ([1, 1, 1, 1, 1], true, true) => {
+            if hand[0].rank == 8 {
+                HandRank::RoyalFlush { cards: hand }
+            } else {
+                HandRank::StraightFlush { cards: hand }
+            }
+        },
+        ([4, 1, 0, 0, 0], _, _) => HandRank::FourKind { four_cards: (*groups.get(0).unwrap().clone()).try_into().unwrap(), kicker: *groups.get(1).unwrap().first().unwrap() },
+        ([3, 2, 0, 0, 0], _, _) => HandRank::FullHouse { three_cards: (*groups.get(0).unwrap().clone()).try_into().unwrap(), pair_cards: (*groups.get(1).unwrap().clone()).try_into().unwrap() },
+        ([3, 1, 1, 0, 0], _, _) => HandRank::ThreeKind { three_cards: (*groups.get(0).unwrap().clone()).try_into().unwrap(), kickers: get_sorted_kickers(groups.get(1..).unwrap().clone()).try_into().unwrap()},
+        ([2, 2, 1, 0, 0], _, _) => HandRank::TwoPair { higher_pair_cards: (*groups.get(0).unwrap().clone()).try_into().unwrap(), lower_pair_cards: (*groups.get(1).unwrap().clone()).try_into().unwrap(), kicker: *groups.get(2).unwrap().first().unwrap() },
+        ([2, 1, 1, 1, 0], _, _) => HandRank::OnePair { pair_cards: (*groups.get(0).unwrap().clone()).try_into().unwrap(), kickers: get_sorted_kickers(groups.get(1..).unwrap()).try_into().unwrap() },
+        ([1, 1, 1, 1, 1], false, true) => HandRank::Flush { cards: hand },
+        ([1, 1, 1, 1, 1], true, false) => HandRank::Straight { cards: hand },
+        _ => HandRank::HighCard { kickers: hand }
+    }
+}
+
+fn get_sorted_kickers(groups: &[Vec<Card>]) -> Vec<Card> {
+    let mut kickers = Vec::new();
+    for group in groups {
+        for kicker in group {
+            kickers.push(*kicker);
+        }
+    }
+    kickers.sort_by(|a, b| b.cmp(a));
+    kickers
+}
+
+pub fn get_best_hand_rank(cards: &[Card; 7]) -> HandRank {
+    get_all_combinations(cards).map(|c| rank_hand(&c)).iter().max().unwrap().clone()
+}
+
+pub fn compare_hand_ranks(hand1: &HandRank, hand2: &HandRank) -> (Ordering, ShowdownDecidingFactor) {
+    if hand1.category_byte() != hand2.category_byte() {
+        return (hand1.category_byte().cmp(&hand2.category_byte()), ShowdownDecidingFactor::Category)
+    } else {
+        match (hand1, hand2) {
+            (HandRank::HighCard { kickers: kickers1 }, HandRank::HighCard { kickers: kickers2 }) => compare_kickers(kickers1, kickers2),
+            (HandRank::OnePair { pair_cards: pair_cards1, kickers: kickers1 }, HandRank::OnePair { pair_cards: pair_cards2, kickers: kickers2 }) => compare_primary_and_kickers(pair_cards1, pair_cards2, kickers1, kickers2),
+            (HandRank::TwoPair { higher_pair_cards: higher_pair_cards1, lower_pair_cards: lower_pair_cards1, kicker: kicker1 }, HandRank::TwoPair { higher_pair_cards: higher_pair_cards2, lower_pair_cards: lower_pair_cards2, kicker: kicker2 }) => {
+                let ord = higher_pair_cards1[0].cmp(&higher_pair_cards2[0]);
+                if ord != Ordering::Equal {
+                    return (ord, make_card_sdf(1, higher_pair_cards1[0], higher_pair_cards2[1]))
+                }
+                let ord = lower_pair_cards1[0].cmp(&lower_pair_cards2[0]);
+                if ord != Ordering::Equal {
+                    return (ord, make_card_sdf(2, higher_pair_cards1[0], higher_pair_cards2[1]))
+                }
+                compare_kickers(&[*kicker1], &[*kicker2])
+            },
+            (HandRank::ThreeKind { three_cards: three_cards1, kickers: kickers1 }, HandRank::ThreeKind { three_cards: three_cards2, kickers: kickers2 }) => compare_primary_and_kickers(three_cards1, three_cards2, kickers1, kickers2),
+            (HandRank::Straight { cards: cards1 }, HandRank::Straight { cards: cards2 }) => compare_kickers(cards1, cards2),
+            (HandRank::Flush { cards: cards1 }, HandRank::Flush { cards: cards2 }) => compare_kickers(cards1, cards2),
+            (HandRank::FullHouse { three_cards: three_cards1, pair_cards: pair_cards1 }, HandRank::FullHouse { three_cards: three_cards2, pair_cards: pair_cards2 }) => {
+                let ord = three_cards1[0].cmp(&three_cards2[0]);
+                if ord != Ordering::Equal {
+                    return (ord, make_card_sdf(1, three_cards1[0], three_cards2[1]))
+                }
+                let ord = pair_cards1[0].cmp(&pair_cards2[0]);
+                if ord != Ordering::Equal {
+                    return (ord, make_card_sdf(2, pair_cards1[0], pair_cards2[1]))
+                }
+                (Ordering::Equal, ShowdownDecidingFactor::None)
+            },
+            (HandRank::FourKind { four_cards: four_cards1, kicker: kicker1 }, HandRank::FourKind { four_cards: four_cards2, kicker: kicker2 }) => compare_primary_and_kickers(four_cards1, four_cards2, &[*kicker1], &[*kicker2]),
+            (HandRank::StraightFlush { cards: cards1 }, HandRank::StraightFlush { cards: cards2 }) => compare_kickers(cards1, cards2),
+            (HandRank::RoyalFlush { .. }, HandRank::RoyalFlush { .. }) => (Ordering::Equal, ShowdownDecidingFactor::None),
+            _ => panic!("unreachable")
+        }
+    }
+}
+
+fn compare_primary_and_kickers(primary_cards1: &[Card], primary_cards2: &[Card], kickers1: &[Card], kickers2: &[Card]) -> (Ordering, ShowdownDecidingFactor) {
+    let ord = primary_cards1[0].cmp(&primary_cards2[0]);
+    if ord != Ordering::Equal {
+        return (ord, make_card_sdf(1, primary_cards1[0], primary_cards2[1]))
+    }
+    compare_kickers(kickers1, kickers2)
+}
+
+fn compare_kickers(kickers1: &[Card], kickers2: &[Card]) -> (Ordering, ShowdownDecidingFactor) {
+    for (kicker1, kicker2) in kickers1.iter().zip(kickers2) {
+        let ord = kicker1.cmp(kicker2);
+        if ord != Ordering::Equal {
+            return (ord, make_card_sdf(3, *kicker1, *kicker2))
+        }
+    }
+    return (Ordering::Equal, ShowdownDecidingFactor::None)
+}
+
+fn make_card_sdf(factor_id: u8, card1: Card, card2: Card) -> ShowdownDecidingFactor {
+    let higher: Card;
+    let lower: Card;
+    if card1.cmp(&card2) == Ordering::Greater {
+        higher = card1;
+        lower = card2;
+    } else {
+        higher = card2;
+        lower = card1;
+    }
+
+    match factor_id {
+        1 => ShowdownDecidingFactor::Primary(higher, lower),
+        2 => ShowdownDecidingFactor::Secondary(higher, lower),
+        3 => ShowdownDecidingFactor::Kicker(higher, lower),
+        _ => panic!()
+    }
+}
